@@ -5,6 +5,88 @@ import decimal
 from botocore.exceptions import ClientError
 import os
 import datetime
+from time import sleep
+
+
+def create_table(client, name):
+    '''
+    Create a dynamodb table
+    Paramters:
+    client (botocore.client.DynamoDB): the DynamoDB client
+    name (str): name of the table
+    Returns:
+    string: the state of the table, i.e. 'ACTIVE'
+    '''
+    table = client.create_table(
+        TableName=name,
+        KeySchema=[
+            {
+                "AttributeName": "leaseKey",
+                "KeyType": "HASH"
+            }
+        ],
+        AttributeDefinitions=[
+            {
+                "AttributeName": "leaseKey",
+                "AttributeType": "S"
+            }
+        ],
+        ProvisionedThroughput={
+            'ReadCapacityUnits': 10,
+            'WriteCapacityUnits': 10
+        }
+    )
+
+    return table['TableDescription']['TableStatus']
+
+
+def table_exits(client, name):
+    '''
+    Check if the dynamodb table exists
+    Paramters:
+    client (botocore.client.DynamoDB): the DynamoDB client
+    name (str): name of the table
+    Returns:
+    bool: True if it exists, False if not, None on error
+    '''
+    try:
+        client.describe_table(TableName=name)
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            return False
+        else:
+            return None
+
+
+def get_table_status(client, table_name):
+    '''
+    Get the status of a dynamodb table
+    Paramters:
+    client (botocore.client.DynamoDB): the DynamoDB client
+    table_name (str): name of the table
+    Returns:
+    string: the state of the table, i.e. 'ACTIVE'
+    '''
+    return client.describe_table(
+        TableName='PythonKCLSamplew'
+    )['Table']['TableStatus']
+
+
+def table_esists_or_create(client, table_name):
+    if not table_exits(client, table_name):
+        print(f"Table created, status: {create_table(client, table_name)}")
+        status = get_table_status(client, table_name)
+    else:
+        status = ''
+
+    while not status == 'ACTIVE':
+        # poll until the status will be ACTIVE
+        status = get_table_status(client, table_name)
+        sleep(1)
+
+    print(f"Table status: {status}")
+    return status
 
 
 def get_iterator(connection, stream_name, shard_id):
@@ -48,7 +130,7 @@ def get_records(connection, shard, batch_size):
     }
 
 
-def get_shard_row(shard_id):
+def get_shard_row(table, shard_id):
     '''
     Find the row in the table of a shard ID.
 
@@ -84,20 +166,29 @@ def status_code_update(response):
     return response['ResponseMetadata']['HTTPStatusCode']
 
 
-def update_checkpoint(records):
-    '''Update the checkpoint with the sequence_number of the last record'''
+def update_checkpoint(table, worker_id, records):
+    '''
+    Update the checkpoint with the sequence_number of the last record
+    Paramters:
+    table: DynamoDB table to query
+    worker_id (str(uuid)): the worker ID
+    records (dict): the records received from kinesis
+    Returns:
+    response (None|dict): the response with the HTTP result
+    '''
     record = records[-1]
-    row = get_shard_row(record['shard_id'])
+    row = get_shard_row(table, record['shard_id'])
 
     try:
         response = table.update_item(
             Key={
                 'leaseKey': row['leaseKey']
             },
-            UpdateExpression="set leaseCounter = :l, checkpoint = :c",
+            UpdateExpression="set leaseCounter = :l, checkpoint = :c, leaseOwner = :o",
             ExpressionAttributeValues={
                 ':l': decimal.Decimal(row['leaseCounter'] + 1),
-                ':c': record['sequence_number']
+                ':c': record['sequence_number'],
+                ':o': worker_id
             },
             ReturnValues="UPDATED_NEW"
         )
@@ -108,7 +199,7 @@ def update_checkpoint(records):
         return response
 
 
-def create_checkpoint(records):
+def create_checkpoint(table, worker_id, records):
     r = records[-1]
 
     try:
@@ -157,35 +248,35 @@ def process_records(s3_conn, bucket_name, records):
     else:
         return False
 
-# https://docs.aws.amazon.com/streams/latest/dev/kinesis-record-processor-ddb.html
-# 1. leaseKey string - the shardID - Primary partition key
-# 2. checkpoint string - the latest processed sequence number
-# 3. leaseCounter integer - Used for lease versioning so that workers can
-# detect that their lease has been taken by another worker.
-# 4. leaseOwner string (uuid)
-
 
 def main():
+    # the following ENV variables will have to go
     os.environ['BUCKET_NAME'] = 'clickstream-riccardo-test'
     os.environ['BATCH_SIZE'] = '1000'
+    os.environ['PREFIX'] = 'clickstream'
+    prefix = os.environ['PREFIX']
     batch_size = int(os.environ['BATCH_SIZE'])
     bucket_name = os.environ['BUCKET_NAME']
     shard_number = int(os.environ['SHARD_NUMBER'])
+    region_name = 'eu-west-1'
     session = boto3.session.Session(profile_name='aspire')
+    client_dynamo = session.client('dynamodb', region_name)
+    stream_name = 'clickstream_anto_tealium_page_view'
+    table_name = prefix + "_" + stream_name
+    table_esists_or_create(client_dynamo, table_name)
     worker_id = str(uuid.uuid4())
     dynamodb = session.resource(
         'dynamodb',
-        region_name='eu-west-1',
-        endpoint_url="https://dynamodb.eu-west-1.amazonaws.com"
+        region_name=region_name,
+        endpoint_url=f"https://dynamodb.{region_name}.amazonaws.com"
     )
-    stream_name = 'clickstream_anto_tealium_page_view'
     # it should load or create a table using stream_name as table name
     table = dynamodb.Table('PythonKCLSample')  # TODO: must be changed
     connection = session.client('kinesis')
     s3_conn = session.client('s3')
     shards = shards_info(connection, stream_name)
     shard = shards[shard_number]
-    response = get_shard_row(shard['shard_id'])
+    response = get_shard_row(table, shard['shard_id'])
 
     try:
         while True:
@@ -200,19 +291,20 @@ def main():
                 )
                 sequence_numbers = [
                     r['sequence_number'] for r in records['records']]
-                response = get_shard_row(shard['shard_id'])
+                response = get_shard_row(table, shard['shard_id'])
 
                 if response is None:
                     # it could not find any breakpoint
                     process_records(s3_conn, bucket_name, records['records'])
-                    create_checkpoint(records['records'])
+                    create_checkpoint(table, worker_id, records['records'])
                 else:
                     if response['checkpoint'] in sequence_numbers:
                         # found a seq. number in the records that is our checkpoint
                         print('duplicate')
                     else:
                         process_records(s3_conn, bucket_name, records['records'])
-                        code = status_code_update(update_checkpoint(records['records']))
+                        code = status_code_update(
+                            update_checkpoint(table, worker_id, records['records']))
                         print(f"Checkpoint creation return code: {code}")
 
                 # update the next iterator
@@ -223,29 +315,6 @@ def main():
     except KeyboardInterrupt:
         print('SIGINT received, stopping!')
 
-if __name__== "__main__":
-  main()
-  
-# create_table('kinesis')
-# def create_table(name):
-#     table = dynamodb.create_table(
-#         TableName=name,
-#         KeySchema=[
-#             {
-#                 "AttributeName": "leaseKey",
-#                 "KeyType": "HASH"
-#             }
-#         ],
-#         AttributeDefinitions=[
-#             {
-#                 "AttributeName": "leaseKey",
-#                 "AttributeType": "S"
-#             }
-#         ],
-#         ProvisionedThroughput={
-#             'ReadCapacityUnits': 10,
-#             'WriteCapacityUnits': 10
-#         }
-#     )
-#
-#     return "Table status:".format(table.table_status)
+
+if __name__ == "__main__":
+    main()
