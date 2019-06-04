@@ -4,25 +4,7 @@ import uuid
 import decimal
 from botocore.exceptions import ClientError
 import os
-import process_records
 import datetime
-import pytz
-from fastparquet import write
-import pandas as pd
-import collections
-
-
-def flatten(d, parent_key='', sep='_'):
-    items = []
-    for k, v in d.items():
-        new_key = parent_key + sep + k if parent_key else k
-        if isinstance(v, collections.MutableMapping):
-            items.extend(flatten(v, new_key, sep=sep).items())
-        else:
-            items.append((new_key, v))
-    return dict(items)
-
-# https://stackoverflow.com/questions/22100206/consuming-a-kinesis-stream-in-python
 
 
 def get_iterator(connection, stream_name, shard_id):
@@ -48,16 +30,22 @@ def shards_info(connection, stream_name):
     ]
 
 
-def get_records(connection, shard):
-    response = connection.get_records(ShardIterator=shard['iterator'], Limit=10)
-    return [
-        {
-            'data': json.loads(r['Data'].decode()),
-            'sequence_number': r['SequenceNumber'],
-            'shard_id': shard['shard_id']
-        }
-        for r in response['Records']
-    ]
+def get_records(connection, shard, batch_size):
+    response = connection.get_records(
+        ShardIterator=shard['iterator'],
+        Limit=batch_size
+    )
+    return {
+        'records': [
+            {
+                'data': json.loads(r['Data'].decode()),
+                'sequence_number': r['SequenceNumber'],
+                'shard_id': shard['shard_id']
+            }
+            for r in response['Records']
+        ],
+        'iterator': response['NextShardIterator']
+    }
 
 
 def get_shard_row(shard_id):
@@ -156,6 +144,7 @@ def event_time_to_s3_key(event, file_name):
 def process_records(s3_conn, bucket_name, records):
     if len(records) > 0:
         event_time = records[0]['data']['event_date_time']
+        print(f"Processing, event time of batch is {event_time}.")
         data_records = [r['data'] for r in records]
 
         record_bytes = json.dumps(data_records)
@@ -176,63 +165,67 @@ def process_records(s3_conn, bucket_name, records):
 # 4. leaseOwner string (uuid)
 
 
-os.environ['SHARD_NUMBER'] = '0'
-os.environ['BUCKET_NAME'] = 'clickstream-riccardo-test'
-bucket_name = os.environ['BUCKET_NAME']
-shard_number = int(os.environ['SHARD_NUMBER'])
-session = boto3.session.Session(profile_name='aspire')
-worker_id = str(uuid.uuid4())
-dynamodb = session.resource(
-    'dynamodb',
-    region_name='eu-west-1',
-    endpoint_url="https://dynamodb.eu-west-1.amazonaws.com"
-)
-stream_name = 'clickstream_anto_tealium_page_view'
-# it should load or create a table using stream_name as table name
-table = dynamodb.Table('PythonKCLSample')  # TODO: must be changed
-connection = session.client('kinesis')
-s3_conn = session.client('s3')
-shards = shards_info(connection, stream_name)
-shard = shards[shard_number]
-
-try:
-    records = get_records(connection, shard)
-except ClientError:
-    # The iterator has expired, so we get a new one
+def main():
+    os.environ['BUCKET_NAME'] = 'clickstream-riccardo-test'
+    os.environ['BATCH_SIZE'] = '1000'
+    batch_size = int(os.environ['BATCH_SIZE'])
+    bucket_name = os.environ['BUCKET_NAME']
+    shard_number = int(os.environ['SHARD_NUMBER'])
+    session = boto3.session.Session(profile_name='aspire')
+    worker_id = str(uuid.uuid4())
+    dynamodb = session.resource(
+        'dynamodb',
+        region_name='eu-west-1',
+        endpoint_url="https://dynamodb.eu-west-1.amazonaws.com"
+    )
+    stream_name = 'clickstream_anto_tealium_page_view'
+    # it should load or create a table using stream_name as table name
+    table = dynamodb.Table('PythonKCLSample')  # TODO: must be changed
+    connection = session.client('kinesis')
+    s3_conn = session.client('s3')
     shards = shards_info(connection, stream_name)
-    shard = shards[0]
-    records = get_records(connection, shard)
+    shard = shards[shard_number]
+    response = get_shard_row(shard['shard_id'])
 
-records_processed = process_records(s3_conn, bucket_name, records)
+    try:
+        while True:
+            try:
+                records = get_records(connection, shard, batch_size)
+            except ClientError:
+                print("Client error")
+            else:
+                print("Fetched {} records, shard ID: {}.".format(
+                        len(records['records']), shard['shard_id']
+                    )
+                )
+                sequence_numbers = [
+                    r['sequence_number'] for r in records['records']]
+                response = get_shard_row(shard['shard_id'])
 
-data_records = [flatten(r['data']) for r in records]
-dt = data_records[0]
+                if response is None:
+                    # it could not find any breakpoint
+                    process_records(s3_conn, bucket_name, records['records'])
+                    create_checkpoint(records['records'])
+                else:
+                    if response['checkpoint'] in sequence_numbers:
+                        # found a seq. number in the records that is our checkpoint
+                        print('duplicate')
+                    else:
+                        process_records(s3_conn, bucket_name, records['records'])
+                        code = status_code_update(update_checkpoint(records['records']))
+                        print(f"Checkpoint creation return code: {code}")
 
+                # update the next iterator
+                shard = {
+                    'shard_id': shard['shard_id'],
+                    'iterator': records['iterator']
+                }
+    except KeyboardInterrupt:
+        print('SIGINT received, stopping!')
 
-def iterr(dt):
-    for k, v in dt.items():
-        if type(v) == list:
-            print(k, type(v))
-        elif type(v) == dict:
-            for k, v in dt.items():
-                print(k, type(v))
-        else:
-            print(k, type(v))
-
-iterr(dt)
-
-if records_processed:
-    response = get_shard_row('shardId-000000000000')
-
-    if response is None:
-        create_checkpoint(records)
-    else:
-        if status_code_update(update_checkpoint(records)) == 200:
-            print('Updated')
-        else:
-            print('Not Updated')
-
-
+if __name__== "__main__":
+  main()
+  
 # create_table('kinesis')
 # def create_table(name):
 #     table = dynamodb.create_table(
